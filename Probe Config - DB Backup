@@ -1,0 +1,69 @@
+resp,rc = nimbus.request("hub", "gethubs")
+local hosts = {}
+local total_bytes_read = 0
+
+rb = database.open("provider=nis;database=nis;driver=none")
+currentdate = os.date("%Y_%m_%d")
+tabletobeused =  "probe_config_daily"-- .. currentdate
+
+query = "CREATE TABLE " .. tabletobeused .. " (id integer IDENTITY(1,1) primary key, hub varchar(255), robot varchar(255), probe varchar(255), version varchar(255), config text);"
+database.query(query)
+
+for h,hinfo in pairs(resp.hublist) do
+   local args = pds.create()
+   pds.putInt(args, "detail", 1) 
+   sessionhandle = nimbus.session_open(hinfo.addr)
+   
+   if sessionhandle ~= nil then   
+      local r_resp,rc = nimbus.session_request(sessionhandle, "getrobots", args, 300)--pull robot list info
+   
+      if rc == 0 then --only proceed if hub query is successful
+         for r,rinfo in pairs(r_resp.robotlist) do
+            --print (rinfo.addr)
+            if rinfo.status ~= 2 then --if robot is down do not list probes
+               addressarray = split(rinfo.addr, "/")
+               origin = addressarray[2]
+               hostname = addressarray[3]
+               local probearray, rc = nimbus.request(rinfo.addr, "probe_list", "", 300)
+               if probearray ~= nil then
+                  for probelist_index, probelist_value in pairs(probearray) do        
+                     if not (probelist_index == "controller" or probelist_index == "spooler" or probelist_index == "hdb") then
+                        if probelist_value.config ~= nil then  --do not proceed if there is no config file
+                           local args2 = pds.create()  
+                           pds.putString(args2, "directory", probelist_value.workdir)
+                           pds.putString(args2, "file", probelist_value.config)                    
+                           pds.putInt(args2, "buffer_size", 1000000)
+                           local configfile, rc = nimbus.request(rinfo.addr, "text_file_get", args2)
+                           --print(rinfo.addr)                                      
+                           if rc == 0 then  
+                              local configtext = configfile.file_content
+                              total_bytes_read = total_bytes_read + configfile.read
+                              configtext = configtext:gsub("'", "££")--replace single quotes with ££ because cannot have single quotes in sql insert statement below. Just replace ££ with ' when pulling a config
+                              configtext = configtext:gsub("\n", "¢¢")--replace new line characters with ¢¢ to better preserve text pad format.  Just replace ¢¢ with \n when pulling a config
+                              myInsert =  "INSERT INTO " ..tabletobeused.." (hub,robot,probe,version,config) VALUES ('"..origin.."','"..hostname.."','"..probelist_value.name.."','"..probelist_value.pkg_version.."','"..configtext.."')"
+                              print("Probe backup successful for: " ..origin..","..hostname..","..probelist_value.name.."; Bytes received: "..configfile.read)
+                              database.query(myInsert)
+                              --print(myInsert)                                                                 
+                           else
+                              --print("Probe info Request for " .. origin.. "-" ..hostname.. " failed with error code: " ..rc)
+                           end --endif
+                        end --end if
+                     end --end if
+                  end   --end for
+               end --end if               
+            end --end if
+               --print("\n")
+         end --end for 
+      else
+        print("Error "..rc.." with request to: "..hinfo.addr)
+      end --end if
+   end --end if
+   nimbus.session_close(sessionhandle)   
+end --end for
+
+query = "INSERT INTO probe_config_table_index (tablename,total_bytes_stored) VALUES ('" .. tabletobeused .. "','" .. total_bytes_read .. "')"
+--print (query)
+database.query(query)
+
+database.close()
+print ("Config Backup script completed.  Total bytes stored: ".. total_bytes_read)
